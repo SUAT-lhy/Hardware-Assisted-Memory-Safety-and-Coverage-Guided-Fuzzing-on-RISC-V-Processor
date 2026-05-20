@@ -1,0 +1,10 @@
+sim/build_*/
+sim/sim_hlct
+sim/sim_mterv
+*.d
+experiments/vuln_plain
+experiments/vuln_afl
+experiments/vuln_asan
+experiments/afl_out*/
+sw/afl_driver/*.o
+sw/afl_driver/*.so

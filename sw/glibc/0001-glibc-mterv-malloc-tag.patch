@@ -1,0 +1,96 @@
+From: HAST-RV Authors <hast-rv@example.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] glibc malloc: inject MTE-RV colour tags on alloc, clear on free
+
+On MTE-RV-enabled RISC-V platforms, assign a random 4-bit colour to each
+malloc() return and encode it into ptr[63:60]; write the colour to the tag
+shadow memory so that the hardware comparator can verify subsequent accesses.
+On free(), zero the tag shadow so stale (use-after-free) pointers are detected.
+
+malloc/malloc.c | 44 ++++++++++++++++++++++++++++++++++++++++++++
+1 file changed, 44 insertions(+)
+
+diff --git a/malloc/malloc.c b/malloc/malloc.c
+index b3e5678..c9a1234 100644
+--- a/malloc/malloc.c
++++ b/malloc/malloc.c
+@@ -1,5 +1,6 @@
+ /* Malloc implementation for multiple threads without lock contention. */
+ #include <malloc.h>
++#include <sys/mman.h>
+
++/* ---- MTE-RV tag management (RISC-V Sv39, bits [63:60] unused) ---------- */
++#ifdef MTERV_ENABLED
++
++#define MTERV_TAGMEM_BASE  0x8F000000UL
++#define MTERV_GRANULE      16UL
++#define MTERV_PTR_COLOUR(c,p) \
++    ((void *)((unsigned long)(p) | ((unsigned long)(c) << 60)))
++#define MTERV_REAL_ADDR(p) \
++    ((void *)((unsigned long)(p) & ~(0xFUL << 60)))
++
++static volatile uint8_t *mterv_tagmem;
++
++/* Called once during malloc initialisation */
++static void mterv_init(void) __attribute__((constructor));
++static void mterv_init(void)
++{
++    int fd = open("/dev/mem", O_RDWR | O_SYNC);
++    if (fd < 0) return;
++    mterv_tagmem = mmap(NULL, 0x1000000 /* 16 MB */,
++                        PROT_READ | PROT_WRITE, MAP_SHARED,
++                        fd, MTERV_TAGMEM_BASE);
++    close(fd);
++    if (mterv_tagmem == MAP_FAILED) mterv_tagmem = NULL;
++}
++
++/* Write 4-bit colour for every 16-byte granule in [base, base+size) */
++static void mterv_set_colour(void *base, size_t size, uint8_t colour)
++{
++    unsigned long addr = (unsigned long)MTERV_REAL_ADDR(base);
++    unsigned long end  = addr + size;
++    if (!mterv_tagmem) return;
++    for (; addr < end; addr += MTERV_GRANULE) {
++        unsigned long gi  = addr / MTERV_GRANULE;
++        unsigned long off = gi / 2;
++        uint8_t old = mterv_tagmem[off];
++        if (gi & 1)
++            mterv_tagmem[off] = (old & 0x0F) | (colour << 4);
++        else
++            mterv_tagmem[off] = (old & 0xF0) | (colour & 0x0F);
++    }
++}
++
++/* ---- Patched _int_malloc: assign random colour, tag all granules -------- */
++static void *mterv_tag_ptr(void *p, size_t size)
++{
++    uint8_t colour;
++    if (!p || !mterv_tagmem) return p;
++    /* Random 4-bit colour; avoid 0 (untagged) */
++    colour = (uint8_t)((rand() & 0xF) | 1);
++    mterv_set_colour(p, size, colour);
++    return MTERV_PTR_COLOUR(colour, p);
++}
++
++/* ---- Patched _int_free: zero tag to catch use-after-free ---------------- */
++static void mterv_untag_ptr(void *p, size_t size)
++{
++    if (!p || !mterv_tagmem) return;
++    mterv_set_colour(MTERV_REAL_ADDR(p), size, 0);
++}
++
++#else  /* !MTERV_ENABLED — no-op stubs */
++#define mterv_tag_ptr(p, s)   (p)
++#define mterv_untag_ptr(p, s) do {} while (0)
++#endif /* MTERV_ENABLED */
+
+ /* Hook points into _int_malloc / _int_free (simplified diff) */
+-    return chunk2mem(p);
++    void *ret = chunk2mem(p);
++    return mterv_tag_ptr(ret, bytes);
+
+-    _int_free(av, p, 0);
++    mterv_untag_ptr(mem, chunksize(p) - 2*SIZE_SZ);
++    _int_free(av, p, 0);
+--
+2.39.0

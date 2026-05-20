@@ -1,0 +1,104 @@
+From: HAST-RV Authors <hast-rv@example.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] riscv: distinguish MTE-RV tag-mismatch faults from page faults
+
+When the MTE-RV hardware tag comparator fires a Load/Store Access Fault
+(cause 5 or 7), the fault address carries the offending tagged pointer.
+Detect the mismatch by re-checking the tag against the shadow tag memory
+and deliver SIGSEGV with si_code=SEGV_MTEAERR so that user-space tools
+(sanitiser runtimes, debuggers) can distinguish tag violations from genuine
+page faults.
+
+arch/riscv/kernel/traps.c | 52 ++++++++++++++++++++++++++++++++++++++-
+1 file changed, 51 insertions(+), 1 deletion(-)
+
+diff --git a/arch/riscv/kernel/traps.c b/arch/riscv/kernel/traps.c
+index a1b2c3d..f4e5678 100644
+--- a/arch/riscv/kernel/traps.c
++++ b/arch/riscv/kernel/traps.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ #include <linux/kernel.h>
+ #include <linux/sched/signal.h>
++#include <linux/mte_rv.h>
+ #include <asm/ptrace.h>
+ #include <asm/traps.h>
+
+@@ -170,12 +171,62 @@ DO_ERROR_INFO(do_trap_insn_misaligned,
+ DO_ERROR_INFO(do_trap_insn_fault,
+ 	SIGBUS, BUS_ADRERR, "instruction access fault");
+
++/* ---- MTE-RV tag shadow memory helpers ---------------------------------- */
++#define MTERV_TAGMEM_BASE  0x8F000000UL
++#define MTERV_TAGMEM_END   0x8FFFFFFFUL
++#define MTERV_PTR_TAG(p)   (((unsigned long)(p) >> 60) & 0xFUL)
++#define MTERV_GRANULE      16UL
++
++/*
++ * mterv_is_tag_fault - return true if the access fault at @addr was caused
++ * by a MTE-RV colour mismatch rather than a genuine unmapped-page fault.
++ *
++ * We re-derive what the hardware comparator saw:
++ *   mem_colour  = nibble from tag shadow at floor(real_addr / 16)
++ *   ptr_colour  = addr[63:60]
++ * If they differ the hardware already fired; we just confirm here so we
++ * can set the right si_code.
++ */
++static bool mterv_is_tag_fault(unsigned long addr)
++{
++	unsigned long real_addr = addr & ~(0xFUL << 60);
++	unsigned long granule_idx = real_addr / MTERV_GRANULE;
++	unsigned long tagmem_byte_addr = MTERV_TAGMEM_BASE + (granule_idx / 2);
++	u8 packed_byte, mem_colour;
++	unsigned long ptr_colour = MTERV_PTR_TAG(addr);
++
++	if (tagmem_byte_addr > MTERV_TAGMEM_END)
++		return false;
++
++	/* Read from tag shadow — mapped via early_ioremap during boot */
++	packed_byte = readb_relaxed((void __iomem *)phys_to_virt(tagmem_byte_addr));
++	mem_colour = (granule_idx & 1) ? (packed_byte >> 4) : (packed_byte & 0xF);
++
++	return ptr_colour != mem_colour;
++}
++
++static void mterv_send_sigsegv(struct pt_regs *regs, unsigned long addr,
++				int cause)
++{
++	struct kernel_siginfo info;
++
++	clear_siginfo(&info);
++	info.si_signo = SIGSEGV;
++	info.si_errno = 0;
++	info.si_code  = SEGV_MTEAERR;     /* MTE async tag error — reused here */
++	info.si_addr  = (void __user *)addr;
++	force_sig_info(&info);
++}
++
++/* ---- Patched load / store access-fault handlers ------------------------ */
++
+ asmlinkage void do_trap_load_fault(struct pt_regs *regs)
+ {
+-	do_trap_error(regs, SIGBUS, BUS_ADRERR, regs->badaddr,
+-		      "load access fault");
++	unsigned long addr = regs->badaddr;
++	if (mterv_is_tag_fault(addr)) {
++		mterv_send_sigsegv(regs, addr, EXC_LOAD_ACCESS);
++		return;
++	}
++	do_trap_error(regs, SIGBUS, BUS_ADRERR, addr, "load access fault");
+ }
+
+ asmlinkage void do_trap_store_fault(struct pt_regs *regs)
+ {
+-	do_trap_error(regs, SIGBUS, BUS_ADRERR, regs->badaddr,
+-		      "store (or AMO) access fault");
++	unsigned long addr = regs->badaddr;
++	if (mterv_is_tag_fault(addr)) {
++		mterv_send_sigsegv(regs, addr, EXC_STORE_ACCESS);
++		return;
++	}
++	do_trap_error(regs, SIGBUS, BUS_ADRERR, addr, "store (or AMO) access fault");
+ }
+--
+2.39.0

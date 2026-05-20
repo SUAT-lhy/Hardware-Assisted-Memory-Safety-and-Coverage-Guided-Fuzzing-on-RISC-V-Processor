@@ -166,6 +166,3 @@ make riscv         # RISC-V cross-compile
 - TIMBER-V: Weiser et al., NDSS 2019
 - kAFL: Schumilo et al., USENIX Security 2017
 
----
-
-*Submitted to CIVS 2026 (Springer LNCS). Supported by the Guangdong Science and Technology Programme and the SUAT Research Fund.*

@@ -1,7 +1,4 @@
 # HAST-RV: Hardware-Assisted Memory Safety and Coverage-Guided Fuzzing on RISC-V
-
-> Implementation artifacts for the CIVS 2026 paper (Springer LNCS)
-
 ---
 
 ## Overview
